@@ -1,0 +1,43 @@
+# ---- Document I/O ----
+PyMuPDF==1.24.10          # fitz: render PDF->image, rebuild flattened PDF
+Pillow==10.4.0
+numpy==1.26.4
+opencv-python-headless==4.10.0.84   # masking, deskew (headless = no GUI deps in Docker)
+
+# ---- Detection: visual (stamps / signatures / face zones) ----
+ultralytics==8.3.0        # YOLOv8/v10 train + inference
+onnxruntime==1.19.2       # CPU inference of exported ONNX model (no torch in prod)
+
+# ---- Detection: text / OCR ----
+paddleocr==2.8.1          # word-level bounding boxes (good on RU)
+paddlepaddle==2.6.2       # CPU build; swap for gpu build if needed
+
+# ---- PII filtering (RU) ----
+natasha==1.6.0            # lightweight RU NER (names etc.)
+easyocr==1.7.2            # better RU text reading than Paddle RU
+torch==2.5.1+cpu              # CPU-only: smaller download (~200 MB vs 900 MB GPU)
+# NOTE: Natasha recall on full names is NOT 1.0 - we catch names primarily as a YOLO/OCR zone.
+
+# ---- Backend / API ----
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9   # file uploads
+pydantic==2.9.2
+pydantic-settings==2.5.2
+
+# ---- UI ----
+streamlit==1.38.0
+
+# ---- Tests / recall harness ----
+pytest==8.3.3
+
+# ---- UI helpers ----
+requests==2.32.3
+
+# ---- Optional later: real queue. Kept out of MVP to avoid Redis on-prem ----
+# arq==0.26.0
+# redis==5.0.8
+pytesseract
+cryptography==44.0.0
+customtkinter==6.0.0
+tkinterdnd2==0.6.2

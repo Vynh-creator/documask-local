@@ -1,0 +1,41 @@
+# DocuMask-Local: API + Worker + UI в одном docker-compose
+# Запуск: docker compose up -d
+# UI: http://localhost:8501
+# API: http://localhost:8000 (для прямых вызовов)
+
+services:
+  api:
+    build: .
+    command: uvicorn documask.api:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./_work:/home/documask/app/_work
+      - ./models:/home/documask/app/models:ro
+    environment:
+      - DOCUMASK_WORK_DIR=/home/documask/app/_work
+      - DOCUMASK_DB_PATH=/home/documask/app/_work/documask.db
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: python -m documask.worker
+    volumes:
+      - ./_work:/home/documask/app/_work
+      - ./models:/home/documask/app/models:ro
+    environment:
+      - DOCUMASK_WORK_DIR=/home/documask/app/_work
+      - DOCUMASK_DB_PATH=/home/documask/app/_work/documask.db
+    restart: unless-stopped
+
+  ui:
+    build: .
+    command: streamlit run documask/ui.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./_work:/home/documask/app/_work
+    environment:
+      - DOCUMASK_WORK_DIR=/home/documask/app/_work
+      - DOCUMASK_API_URL=http://api:8000
+    restart: unless-stopped
