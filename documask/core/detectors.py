@@ -157,7 +157,19 @@ def ocr_words(img: np.ndarray, page: int) -> list[OcrWord]:
 # ---------------------------------------------------------------------------
 # 1. Regex (структурные ПДн РФ)
 # ---------------------------------------------------------------------------
+# Контекстные маркеры: если рядом с числовым паттерном есть эти слова —
+# уверенно считаем ПДн. Если нет — пропускаем (жадный паттерн без контекста).
+CONTEXT_MARKERS: dict[PiiKind, list[str]] = {
+    PiiKind.PASSPORT: ["паспорт", "серия", "серии", "сер.", "номер", "выдан", "документ"],
+    PiiKind.SNILS:    ["снилс", "снилс", "страхов", "пенсион"],
+    PiiKind.INN:      ["инн", "налог"],
+    PiiKind.DATE:     ["дата", "рождения", "выдачи", "выдан", "год"],
+    PiiKind.AMOUNT:   ["сумма", "руб", "рублей", "стоимость", "цена"],
+    PiiKind.PHONE:    ["тел", "телефон", "моб", "контакт"],
+    PiiKind.EMAIL:    ["email", "e-mail", "почта", "контакт"],
+}
 # Паттерны намеренно слегка жадные. Ложное срабатывание = безвредная перемазка.
+# Для голых чисел (без контекстных маркеров) — пропускаем, если не нашли рядом слов-маркеров.
 PATTERNS: dict[PiiKind, re.Pattern] = {
     # ШАГ: заполни их. Точки старта (уточняй на реальных данных):
     PiiKind.PASSPORT: re.compile(
@@ -182,6 +194,30 @@ PATTERNS: dict[PiiKind, re.Pattern] = {
         r"|\b[А-ЯЁA-Z][а-яёa-z]+\s+[А-ЯЁA-Z][а-яёa-z]+\b"     # Иванов Иван / John Smith (два слова)
     ),
 }
+
+
+CONTEXT_WINDOW = 10  # сколько слов вокруг проверять на контекстные маркеры
+
+
+def _has_context(hit_words: list[OcrWord], all_words: list[OcrWord], kind: PiiKind) -> bool:
+    """Проверить, есть ли рядом с найденным паттерном слова-маркеры ПДн."""
+    markers = CONTEXT_MARKERS.get(kind, [])
+    if not markers:
+        return True  # нет маркеров = всегда принимаем (например FIO)
+    hit_positions = {id(w) for w in hit_words}
+    # Взять окно ±CONTEXT_WINDOW слов вокруг hit
+    hit_indices = [i for i, w in enumerate(all_words) if id(w) in hit_positions]
+    if not hit_indices:
+        return True
+    lo = max(0, min(hit_indices) - CONTEXT_WINDOW)
+    hi = min(len(all_words), max(hit_indices) + CONTEXT_WINDOW + 1)
+    for i in range(lo, hi):
+        if i in hit_indices:
+            continue
+        word_lower = all_words[i].text.lower().strip(":.,;()№\"'")
+        if any(marker in word_lower for marker in markers):
+            return True
+    return False
 
 
 class RegexDetector:
@@ -214,6 +250,9 @@ class RegexDetector:
                 ms, me = m.start(), m.end()
                 hit = [w for (s, e, w) in spans if s < me and e > ms]
                 if not hit:
+                    continue
+                # Контекстная проверка: для числовых паттернов ищем маркеры рядом
+                if kind in CONTEXT_MARKERS and not _has_context(hit, words, kind):
                     continue
                 boxes.append(Box(
                     x1 = min([i.x1 for i in hit]),
@@ -448,6 +487,85 @@ class YoloDetector:
         
             
             
+
+
+# ---------------------------------------------------------------------------
+# 4. ContextDetector (NLP-подобный: ищет метки и маскирует всю строку)
+# ---------------------------------------------------------------------------
+LABEL_KINDS: dict[str, PiiKind] = {
+    "паспорт": PiiKind.PASSPORT,
+    "серия": PiiKind.PASSPORT,
+    "снилс": PiiKind.SNILS,
+    "инн": PiiKind.INN,
+    "фио": PiiKind.FIO,
+    "ф.и.о": PiiKind.FIO,
+    "фамилия": PiiKind.FIO,
+    "имя": PiiKind.FIO,
+    "отчество": PiiKind.FIO,
+    "телефон": PiiKind.PHONE,
+    "тел": PiiKind.PHONE,
+    "email": PiiKind.EMAIL,
+    "e-mail": PiiKind.EMAIL,
+    "дата": PiiKind.DATE,
+    "сумма": PiiKind.AMOUNT,
+    "адрес": PiiKind.OTHER,
+}
+
+
+class ContextDetector:
+    """NLP-подобный детектор: ищет метки полей и маскирует всю строку.
+
+    В отличие от regex (который ищет конкретный формат), этот детектор
+    находит строки с метками вроде «Паспорт:» и замазывает ВСЮ строку
+    целиком — независимо от формата значения. Это страховка от нестандартных
+    форматов записи.
+    """
+
+    def detect(self, words: list[OcrWord], page: int) -> list[Box]:
+        if not words:
+            return []
+        boxes: list[Box] = []
+        # Группируем слова по строкам (y-координата с допуском)
+        lines = _group_by_lines(words)
+        for line_words in lines:
+            line_text = " ".join(w.text.lower().strip(":.,;()№\"'") for w in line_words)
+            for label, kind in LABEL_KINDS.items():
+                if label not in line_text:
+                    continue
+                # Нашли метку — маскируем всю строку
+                x1 = min(w.x1 for w in line_words)
+                y1 = min(w.y1 for w in line_words)
+                x2 = max(w.x2 for w in line_words)
+                y2 = max(w.y2 for w in line_words)
+                boxes.append(Box(
+                    x1=x1, y1=y1, x2=x2, y2=y2,
+                    page=page, kind=kind,
+                    source=DetectorSource.REGEX,
+                    score=0.85,
+                    text=line_text[:100],
+                ))
+                break  # одна метка на строку
+        return boxes
+
+
+def _group_by_lines(words: list[OcrWord], y_tolerance: int = 10) -> list[list[OcrWord]]:
+    """Группировать OCR-слова в строки по y-координате."""
+    if not words:
+        return []
+    sorted_words = sorted(words, key=lambda w: (w.y1 + w.y2) / 2)
+    lines: list[list[OcrWord]] = []
+    current_line: list[OcrWord] = [sorted_words[0]]
+    current_y = (sorted_words[0].y1 + sorted_words[0].y2) / 2
+    for w in sorted_words[1:]:
+        wy = (w.y1 + w.y2) / 2
+        if abs(wy - current_y) <= y_tolerance:
+            current_line.append(w)
+        else:
+            lines.append(current_line)
+            current_line = [w]
+            current_y = wy
+    lines.append(current_line)
+    return lines
 
 
 # ---------------------------------------------------------------------------
