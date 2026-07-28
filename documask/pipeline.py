@@ -20,7 +20,7 @@ from typing import Callable, Optional
 
 from documask.config import settings
 from documask.core import pdf_io, merge, masking
-from documask.core.detectors import ocr_words, RegexDetector, NerDetector, YoloDetector, ContextDetector
+from documask.core.detectors import ocr_words, RegexDetector, NerDetector, YoloDetector, BlockClassifier
 from documask.core import verifier
 from documask.schemas import (
     Box,
@@ -42,10 +42,10 @@ ReviewHook = Optional[Callable[[list[PageResult]], list[PageResult]]]
 _regex_detector: Optional[RegexDetector] = None
 _ner_detector: Optional[NerDetector] = None  # NER вернётся когда EasyOCR+torch доступны
 _yolo_detector: Optional[YoloDetector] = None
-_context_detector: Optional[ContextDetector] = None
+_context_detector: Optional[BlockClassifier] = None
 
 
-def _get_detectors() -> tuple[RegexDetector, Optional[NerDetector], YoloDetector, ContextDetector]:
+def _get_detectors() -> tuple[RegexDetector, Optional[NerDetector], YoloDetector, BlockClassifier]:
     global _regex_detector, _ner_detector, _yolo_detector, _context_detector
     if _regex_detector is None:
         _regex_detector = RegexDetector()
@@ -57,7 +57,7 @@ def _get_detectors() -> tuple[RegexDetector, Optional[NerDetector], YoloDetector
         except Exception:
             _ner_detector = None
     if _context_detector is None:
-        _context_detector = ContextDetector()
+        _context_detector = BlockClassifier()
     return _regex_detector, _ner_detector, _yolo_detector, _context_detector
 
 
@@ -137,7 +137,7 @@ def run_pipeline(
             except Exception:
                 pass  # NER упал — не критично, продолжаем без него
 
-        # ContextDetector: маскирует строки с метками (Паспорт:, ФИО:, etc.)
+        # BlockClassifier: классифицирует блоки, обрезает не-PII с краёв
         boxes += context_detector.detect(words, page_idx)
 
         # фильтр по тумблерам UI

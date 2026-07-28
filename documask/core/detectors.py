@@ -191,7 +191,6 @@ PATTERNS: dict[PiiKind, re.Pattern] = {
         r"|\b[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.\s?[А-ЯЁ]\.\b"            # Иванов И.И.
         r"|\b[A-Z][a-z]+\s+[A-Z][a-z]+\s+[A-Z][a-z]+\b"        # John Michael Smith
         r"|\b[A-Z][a-z]+\s+[A-Z]\.\s?[A-Z]\.\b"                # Gasparyan K.I.
-        r"|\b[А-ЯЁA-Z][а-яёa-z]+\s+[А-ЯЁA-Z][а-яёa-z]+\b"     # Иванов Иван / John Smith (два слова)
     ),
 }
 
@@ -490,62 +489,169 @@ class YoloDetector:
 
 
 # ---------------------------------------------------------------------------
-# 4. ContextDetector (NLP-подобный: ищет метки и маскирует всю строку)
+# 4. BlockClassifier — NLP-подобный: скользящее окно с обрезкой по границам PII
 # ---------------------------------------------------------------------------
-LABEL_KINDS: dict[str, PiiKind] = {
-    "паспорт": PiiKind.PASSPORT,
-    "серия": PiiKind.PASSPORT,
-    "снилс": PiiKind.SNILS,
-    "инн": PiiKind.INN,
-    "фио": PiiKind.FIO,
-    "ф.и.о": PiiKind.FIO,
-    "фамилия": PiiKind.FIO,
-    "имя": PiiKind.FIO,
-    "отчество": PiiKind.FIO,
-    "телефон": PiiKind.PHONE,
-    "тел": PiiKind.PHONE,
-    "email": PiiKind.EMAIL,
-    "e-mail": PiiKind.EMAIL,
-    "дата": PiiKind.DATE,
-    "сумма": PiiKind.AMOUNT,
-    "адрес": PiiKind.OTHER,
-}
+class BlockClassifier:
+    """Классифицирует блок текста пословно и обрезает не-PII слова с краёв.
 
-
-class ContextDetector:
-    """NLP-подобный детектор: ищет метки полей и маскирует всю строку.
-
-    В отличие от regex (который ищет конкретный формат), этот детектор
-    находит строки с метками вроде «Паспорт:» и замазывает ВСЮ строку
-    целиком — независимо от формата значения. Это страховка от нестандартных
-    форматов записи.
+    Принцип: берём строку/блок, каждое слово проверяем на PII-признаки
+    (regex + контекстные маркеры + соседство с меткой). Находим непрерывный
+    PII-спан и обрезаем с краёв по одному слову, пока не дойдём до границы
+    где начинается/заканчивается PII. Маскируем только PII-кусок, не всю строку.
     """
+
+    # Слова-метки, которые указывают что ЗНАЧЕНИЕ рядом — PII
+    FIELD_LABELS: dict[str, PiiKind] = {
+        "паспорт": PiiKind.PASSPORT,
+        "серия": PiiKind.PASSPORT,
+        "снилс": PiiKind.SNILS,
+        "инн": PiiKind.INN,
+        "фио": PiiKind.FIO,
+        "ф.и.о": PiiKind.FIO,
+        "фамилия": PiiKind.FIO,
+        "имя": PiiKind.FIO,
+        "отчество": PiiKind.FIO,
+        "телефон": PiiKind.PHONE,
+        "тел": PiiKind.PHONE,
+        "email": PiiKind.EMAIL,
+        "e-mail": PiiKind.EMAIL,
+        "дата": PiiKind.DATE,
+        "рождения": PiiKind.DATE,
+        "сумма": PiiKind.AMOUNT,
+        "адрес": PiiKind.OTHER,
+        "выдан": PiiKind.PASSPORT,
+        "код": PiiKind.PASSPORT,
+        "подразделения": PiiKind.PASSPORT,
+    }
+
+    def __init__(self) -> None:
+        self._regex = RegexDetector()
 
     def detect(self, words: list[OcrWord], page: int) -> list[Box]:
         if not words:
             return []
         boxes: list[Box] = []
-        # Группируем слова по строкам (y-координата с допуском)
         lines = _group_by_lines(words)
+
         for line_words in lines:
-            line_text = " ".join(w.text.lower().strip(":.,;()№\"'") for w in line_words)
-            for label, kind in LABEL_KINDS.items():
-                if label not in line_text:
-                    continue
-                # Нашли метку — маскируем всю строку
-                x1 = min(w.x1 for w in line_words)
-                y1 = min(w.y1 for w in line_words)
-                x2 = max(w.x2 for w in line_words)
-                y2 = max(w.y2 for w in line_words)
-                boxes.append(Box(
-                    x1=x1, y1=y1, x2=x2, y2=y2,
-                    page=page, kind=kind,
-                    source=DetectorSource.REGEX,
-                    score=0.85,
-                    text=line_text[:100],
-                ))
-                break  # одна метка на строку
+            if len(line_words) < 1:
+                continue
+            # 1. Найти метку поля в строке и определить kind
+            label_kind = self._find_label(line_words)
+            if label_kind is None:
+                # Нет явной метки — проверяем regex на всей строке
+                regex_boxes = self._regex.detect(line_words, page)
+                boxes.extend(regex_boxes)
+                continue
+
+            # 2. Классифицировать каждое слово: PII или нет
+            pii_mask = self._classify_words(line_words, label_kind)
+
+            # 3. Найти непрерывный PII-спан
+            pii_words = [w for w, is_pii in zip(line_words, pii_mask) if is_pii]
+            if not pii_words:
+                continue
+
+            # 4. Обрезать с краёв: убираем не-PII слова слева и справа
+            pii_words = self._trim_edges(pii_words, line_words, label_kind)
+
+            if not pii_words:
+                continue
+
+            x1 = min(w.x1 for w in pii_words)
+            y1 = min(w.y1 for w in pii_words)
+            x2 = max(w.x2 for w in pii_words)
+            y2 = max(w.y2 for w in pii_words)
+            boxes.append(Box(
+                x1=x1, y1=y1, x2=x2, y2=y2,
+                page=page, kind=label_kind,
+                source=DetectorSource.REGEX,
+                score=0.9,
+                text=" ".join(w.text for w in pii_words)[:100],
+            ))
+
         return boxes
+
+    def _find_label(self, words: list[OcrWord]) -> Optional[PiiKind]:
+        """Найти метку поля в строке. Вернуть kind или None.
+        Использует точное совпадение слова (или с двоеточием на конце)."""
+        for w in words:
+            t = w.text.lower().strip(":.,;()№\"' \t")
+            # Точное совпадение или слово с двоеточием
+            for label, kind in self.FIELD_LABELS.items():
+                if t == label or t == label + ":":
+                    return kind
+        return None
+
+    def _classify_words(self, words: list[OcrWord], kind: PiiKind) -> list[bool]:
+        """Классифицировать каждое слово: True = PII, False = не PII."""
+        # Найти позицию метки
+        label_idx = -1
+        for i, w in enumerate(words):
+            t = w.text.lower().strip(":.,;()№\"' \t")
+            for label in self.FIELD_LABELS:
+                if t == label or t.startswith(label + ":"):
+                    label_idx = i
+                    break
+            if label_idx >= 0:
+                break
+
+        result = []
+        for i, w in enumerate(words):
+            t = w.text.strip(":.,;()№\"'")
+            # Метка сама по себе — не PII (маскировать не надо)
+            if i == label_idx:
+                result.append(False)
+                continue
+            # После метки — значение, классифицируем
+            if label_idx >= 0 and i > label_idx:
+                result.append(self._is_pii_value(t, kind))
+            else:
+                # До метки — проверяем regex
+                result.append(self._is_pii_value(t, kind))
+        return result
+
+    def _is_pii_value(self, text: str, kind: PiiKind) -> bool:
+        """Проверить, похоже ли слово на значение ПДн заданного типа."""
+        if not text or len(text) < 2:
+            return False
+        # Проверяем regex-паттернами
+        for pattern_kind, pattern in PATTERNS.items():
+            if pattern_kind != kind:
+                continue
+            if pattern.search(text):
+                return True
+        # Для FIO — только если совпал regex (не любое слово с заглавной)
+        if kind == PiiKind.FIO:
+            return False  # regex уже проверили выше
+        # Для DATE — любой текст с цифрами
+        if kind == PiiKind.DATE and any(c.isdigit() for c in text):
+            return True
+        # Для PHONE — если есть цифры
+        if kind == PiiKind.PHONE and any(c.isdigit() for c in text):
+            return True
+        return False
+
+    def _trim_edges(self, pii_words: list[OcrWord], all_words: list[OcrWord],
+                    kind: PiiKind) -> list[OcrWord]:
+        """Обрезать не-PII слова с краёв PII-спана."""
+        if not pii_words:
+            return []
+        # Сортируем по x-координате (слева направо)
+        sorted_pii = sorted(pii_words, key=lambda w: w.x1)
+        # Обрезаем слева: убираем слова, которые не PII
+        while len(sorted_pii) > 1:
+            if not self._is_pii_value(sorted_pii[0].text.strip(":.,;()№\"'"), kind):
+                sorted_pii.pop(0)
+            else:
+                break
+        # Обрезаем справа
+        while len(sorted_pii) > 1:
+            if not self._is_pii_value(sorted_pii[-1].text.strip(":.,;()№\"'"), kind):
+                sorted_pii.pop()
+            else:
+                break
+        return sorted_pii
 
 
 def _group_by_lines(words: list[OcrWord], y_tolerance: int = 10) -> list[list[OcrWord]]:
