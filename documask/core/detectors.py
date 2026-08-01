@@ -160,13 +160,13 @@ def ocr_words(img: np.ndarray, page: int) -> list[OcrWord]:
 # Контекстные маркеры: если рядом с числовым паттерном есть эти слова —
 # уверенно считаем ПДн. Если нет — пропускаем (жадный паттерн без контекста).
 CONTEXT_MARKERS: dict[PiiKind, list[str]] = {
-    PiiKind.PASSPORT: ["паспорт", "серия", "серии", "сер.", "номер", "выдан", "документ"],
+    PiiKind.PASSPORT: ["паспорт", "серия", "серии", "сер.", "номер", "выдан", "документ", "подразделения", "код"],
     PiiKind.SNILS:    ["снилс", "снилс", "страхов", "пенсион"],
     PiiKind.INN:      ["инн", "налог"],
     PiiKind.DATE:     ["дата", "рождения", "выдачи", "выдан", "год"],
     PiiKind.AMOUNT:   ["сумма", "руб", "рублей", "стоимость", "цена"],
     PiiKind.PHONE:    ["тел", "телефон", "моб", "контакт"],
-    PiiKind.EMAIL:    ["email", "e-mail", "почта", "контакт"],
+    PiiKind.EMAIL:    ["email", "e-mail", "почта", "контакт", "@"],
 }
 # Паттерны намеренно слегка жадные. Ложное срабатывание = безвредная перемазка.
 # Для голых чисел (без контекстных маркеров) — пропускаем, если не нашли рядом слов-маркеров.
@@ -180,7 +180,11 @@ PATTERNS: dict[PiiKind, re.Pattern] = {
         r"|\b\d{4}\s+\d{6}\b"                            # 1111 222222 (голые цифры)
     ),
     PiiKind.PHONE:    re.compile(r"(?:\+7|8)[\s\-(]*\d{3}[\s\-)]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}"),
-    PiiKind.EMAIL:    re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b"),
+    PiiKind.EMAIL:    re.compile(
+        r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b"                  # standard email
+        r"|\b[\w.+-]+\s*@\s*[\w-]+\.[\w.-]+\b"           # email with spaces (OCR artifact)
+        r"|\b[\w.+-]+\s*@\s*[\w-]+\s*\.\s*[\w-]+\b"      # email with spaces around dot too
+    ),
     PiiKind.SNILS:    re.compile(r"\b\d{3}-\d{3}-\d{3}\s?\d{2}\b"),
     PiiKind.INN:      re.compile(r"\b\d{10}\b|\b\d{12}\b"),
     PiiKind.DATE:     re.compile(r"\b\d{2}[.\-/]\d{2}[.\-/]\d{4}\b"),
@@ -515,6 +519,9 @@ class BlockClassifier:
         "тел": PiiKind.PHONE,
         "email": PiiKind.EMAIL,
         "e-mail": PiiKind.EMAIL,
+        "e mail": PiiKind.EMAIL,
+        "почта": PiiKind.EMAIL,
+        "почты": PiiKind.EMAIL,
         "дата": PiiKind.DATE,
         "рождения": PiiKind.DATE,
         "сумма": PiiKind.AMOUNT,
